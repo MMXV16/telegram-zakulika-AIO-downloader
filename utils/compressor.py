@@ -317,7 +317,12 @@ async def stream_compress(file_paths: List[str], zip_name: str, max_part_size: i
                 
                 # Check if we need to split to a new part BEFORE writing the chunk
                 if current_size + chunk_len > max_part_size and current_size > 0:
-                    # Close current part and start a new one
+                    # Flush and close current part properly
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())  # Ensure data is written to disk
+                    except (OSError, AttributeError):
+                        pass
                     f.close()
                     multipart_generated = True
                     part_paths.append((part_path, current_size))
@@ -337,12 +342,41 @@ async def stream_compress(file_paths: List[str], zip_name: str, max_part_size: i
                     current_size = 0
                     f = open(part_path, 'wb')
                 
+                # Special handling for very large chunks that might exceed max_part_size themselves
+                if chunk_len > max_part_size:
+                    logger.error(f"Single chunk too large ({format_size(chunk_len)}) for max_part_size ({format_size(max_part_size)})")
+                    logger.info("Chunk exceeds max part size, falling back to standard zipfile compression")
+                    # Close current file and clean up
+                    if f and not f.closed:
+                        f.close()
+                    # Clean up any created parts
+                    for p_path, _ in part_paths:
+                        try:
+                            if os.path.exists(p_path):
+                                os.remove(p_path)
+                        except Exception:
+                            pass
+                    try:
+                        if os.path.exists(part_path):
+                            os.remove(part_path)
+                    except Exception:
+                        pass
+                    return await _fallback_compress(file_paths, zip_name, max_part_size, chat_id, task, client, task_manager)
+                
                 # Write the chunk to current part
                 f.write(chunk)
                 current_size += chunk_len
                 processed_size += chunk_len
                 chunk_count += 1
                 total_chunks_written += chunk_len
+                
+                # Flush data to disk periodically for large files to prevent corruption
+                if chunk_count % 100 == 0:  # Every 100 chunks
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())  # Force write to disk
+                    except (OSError, AttributeError):
+                        pass  # Don't break compression if fsync fails
                 
                 # Log progress for first few chunks and periodically
                 if chunk_count <= 10 or chunk_count % 1000 == 0:
@@ -395,8 +429,13 @@ async def stream_compress(file_paths: List[str], zip_name: str, max_part_size: i
                 return [], "Compression produced no output"
         
         finally:
-            # Always close the file handle
+            # Always flush and close the file handle properly
             if f and not f.closed:
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())  # Ensure final data is written to disk
+                except (OSError, AttributeError):
+                    pass
                 f.close()
         
         # Handle final part
@@ -406,8 +445,25 @@ async def stream_compress(file_paths: List[str], zip_name: str, max_part_size: i
                 part_paths.append((part_path, current_size))
                 logger.info(f"Completed final ZIP part {part_number}: {format_size(current_size)}")
         else:
-            # If no splitting occurred, rename to remove the .001 extension for single file
-            single_part_path = os.path.join(temp_dir, f"{zip_name}.zip")
+            # Check if the single part exceeds max_part_size
+            if current_size > max_part_size:
+                logger.error(f"Single ZIP part too large: {format_size(current_size)} > {format_size(max_part_size)}")
+                logger.info("Single part exceeds size limit, falling back to standard zipfile compression for proper splitting")
+                # Clean up the oversized file
+                try:
+                    if os.path.exists(part_path):
+                        os.remove(part_path)
+                        logger.debug(f"Removed oversized single zipstream output: {part_path}")
+                except Exception:
+                    pass
+                return await _fallback_compress(file_paths, zip_name, max_part_size, chat_id, task, client, task_manager)
+            
+            # If no splitting occurred and size is acceptable, rename to remove the .001 extension for single file
+            # Ensure we don't create double .zip extensions
+            if zip_name.endswith('.zip'):
+                single_part_path = os.path.join(temp_dir, zip_name)
+            else:
+                single_part_path = os.path.join(temp_dir, f"{zip_name}.zip")
             try:
                 if os.path.exists(part_path) and current_size > 0:
                     os.rename(part_path, single_part_path)
@@ -443,6 +499,21 @@ async def stream_compress(file_paths: List[str], zip_name: str, max_part_size: i
                     pass
             return await _fallback_compress(file_paths, zip_name, max_part_size, chat_id, task, client, task_manager)
 
+        # Critical validation: Check if any ZIP part exceeds Telegram's upload limits
+        for part_path, part_size in part_paths:
+            if part_size > max_part_size:
+                logger.error(f"ZIP part {part_path} is too large: {format_size(part_size)} > {format_size(max_part_size)}")
+                logger.info("Part exceeds max_part_size, falling back to standard zipfile compression for proper splitting")
+                # Clean up the oversized files
+                for p_path, _ in part_paths:
+                    try:
+                        if os.path.exists(p_path):
+                            os.remove(p_path)
+                            logger.debug(f"Removed oversized zipstream output: {p_path}")
+                    except Exception:
+                        pass
+                return await _fallback_compress(file_paths, zip_name, max_part_size, chat_id, task, client, task_manager)
+
         # Additional validation: ensure each part is reasonable size (not tiny files)
         for part_path, part_size in part_paths:
             if part_size < 1024:  # Less than 1KB is suspicious for real content
@@ -454,6 +525,38 @@ async def stream_compress(file_paths: List[str], zip_name: str, max_part_size: i
                         if os.path.exists(p_path):
                             os.remove(p_path)
                             logger.debug(f"Removed tiny zipstream output: {p_path}")
+                    except Exception:
+                        pass
+                return await _fallback_compress(file_paths, zip_name, max_part_size, chat_id, task, client, task_manager)
+        
+        # Additional validation: Check if ZIP files are valid/readable
+        for part_path, part_size in part_paths:
+            try:
+                # Try to open and read the first few bytes to ensure file is not corrupted
+                with open(part_path, 'rb') as test_file:
+                    header = test_file.read(4)
+                    # ZIP files should start with 'PK' signature (0x504b)
+                    if not header.startswith(b'PK'):
+                        logger.error(f"Invalid ZIP header in part: {part_path}")
+                        logger.info("Falling back to standard zipfile compression due to invalid ZIP header")
+                        # Clean up the bad files
+                        for p_path, _ in part_paths:
+                            try:
+                                if os.path.exists(p_path):
+                                    os.remove(p_path)
+                                    logger.debug(f"Removed invalid zipstream output: {p_path}")
+                            except Exception:
+                                pass
+                        return await _fallback_compress(file_paths, zip_name, max_part_size, chat_id, task, client, task_manager)
+            except Exception as e:
+                logger.error(f"Cannot validate ZIP part {part_path}: {e}")
+                logger.info("Falling back to standard zipfile compression due to validation error")
+                # Clean up the bad files
+                for p_path, _ in part_paths:
+                    try:
+                        if os.path.exists(p_path):
+                            os.remove(p_path)
+                            logger.debug(f"Removed unreadable zipstream output: {p_path}")
                     except Exception:
                         pass
                 return await _fallback_compress(file_paths, zip_name, max_part_size, chat_id, task, client, task_manager)
@@ -727,6 +830,41 @@ async def _fallback_compress(file_paths: List[str], zip_name: str, max_part_size
             zip_size = os.path.getsize(zip_path)
             logger.info(f"Created large ZIP file with size: {format_size(zip_size)}")
             
+            # Critical validation: Check if the large ZIP exceeds max_part_size
+            if zip_size > max_part_size:
+                logger.warning(f"Created large ZIP ({format_size(zip_size)}) exceeds max part size ({format_size(max_part_size)}), splitting into parts")
+                logger.info(f"Will create parts with naming: {zip_name}.zip.001, {zip_name}.zip.002, etc.")
+                
+                # Split the large ZIP file into multiple parts
+                part_paths_split = await _split_large_zip_file(zip_path, zip_name, max_part_size, temp_dir, progress_msg, client, chat_id)
+                
+                if part_paths_split:
+                    # Remove the original large ZIP file
+                    try:
+                        os.remove(zip_path)
+                        logger.info(f"Removed original large ZIP file: {zip_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove original large ZIP: {e}")
+                    
+                    # Update progress message
+                    if progress_msg and client:
+                        try:
+                            await client.edit_message(
+                                chat_id, 
+                                progress_msg.id, 
+                                f"✅ Compression complete!\n💾 Split into {len(part_paths_split)} parts\n\n⚡Powered by @ZakulikaCompressor_bot"
+                            )
+                            await asyncio.sleep(3)
+                            await progress_msg.delete()
+                        except Exception:
+                            pass
+                    
+                    return part_paths_split, temp_dir
+                else:
+                    logger.error("Failed to split large ZIP file")
+                    return [], "Failed to split large ZIP file"
+            
+            # If size is acceptable, return as single file
             if progress_msg and client:
                 try:
                     await client.edit_message(

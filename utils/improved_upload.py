@@ -6,7 +6,7 @@ import gc
 import psutil
 from typing import List, Tuple, Optional
 
-from telethon.errors import FloodWaitError, TimeoutError
+from telethon.errors import FloodWaitError, TimeoutError, FilePartsInvalidError
 # Note: ConnectionError and NetworkError are built-in Python exceptions, not from telethon
 # Note: ConnectionError and NetworkError are built-in Python exceptions, not from telethon
 from utils.formatting import format_size, format_time
@@ -290,6 +290,25 @@ async def upload_zip_parts_improved(client, chat_id, part_paths, task=None, task
                     logger.error(f"Failed to upload part {part_name} after {UPLOAD_RETRY_COUNT} attempts")
                     failed_parts.append(f"Part {idx} ({str(e)[:30]}...)")
                     success = False
+                    
+            except FilePartsInvalidError as e:
+                logger.error(f"File parts invalid error for {part_name} - file may be corrupted: {e}")
+                logger.info(f"File info - path: {part_path}, size: {part_size}, exists: {os.path.exists(part_path)}")
+                
+                # Check if file is readable and has proper ZIP header
+                try:
+                    with open(part_path, 'rb') as check_file:
+                        header = check_file.read(8)
+                        logger.info(f"File header: {header.hex() if header else 'EMPTY'}")
+                        if len(header) < 4 or not header.startswith(b'PK'):
+                            logger.error(f"File {part_path} has invalid ZIP header - possible corruption")
+                except Exception as check_error:
+                    logger.error(f"Cannot read file {part_path}: {check_error}")
+                
+                logger.error(f"FilePartsInvalidError - skipping part {part_name}, cannot retry this error type")
+                failed_parts.append(f"Part {idx} (corrupted file)")
+                success = False
+                break  # Don't retry FilePartsInvalidError - it indicates file corruption
                     
             except FloodWaitError as fwe:
                 logger.warning(f"Flood wait for part {part_name}: {fwe.seconds}s")

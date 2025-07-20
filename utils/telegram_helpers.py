@@ -313,7 +313,9 @@ async def send_to_telegram(client, file_path: str, chat_id: int, task: Optional[
             return
         
         # Compress directory
-        zip_name = f"{os.path.basename(file_path)}.zip"
+        # Remove any existing extension to prevent double extensions like .zip.zip
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        zip_name = f"{base_name}.zip"
         part_paths, temp_dir = await stream_compress(file_list, zip_name, ZIP_PART_SIZE, chat_id, task, client, task_manager)
         
         if not part_paths:
